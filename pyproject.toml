@@ -1,0 +1,20 @@
+[project]
+name = "cut-cross-entropy"
+dynamic = ["version"]
+readme = "README.md"
+description = "Code for cut cross entropy, a memory efficient implementation of linear-cross-entropy loss."
+requires-python = ">= 3.10"
+
+dependencies = [
+    'triton>=3.0.0'
+]
+
+[build-system]
+requires = ["setuptools >= 61.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["cut_cross_entropy*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "cut_cross_entropy.__version__"}
