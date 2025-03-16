@@ -182,8 +182,6 @@ def _cce_lse_sampled_forward_kernel(
     for idx in range(0, SAMPLE_NUMS):       
         e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
         e_mask = (offs_b[:, None] < BMax) & (offs_d[None, :] < D)
-        # e_ptrs = E + (offs_b[None, :] * stride_eb + offs_d[:, None] * stride_ed)
-        # e_mask = (offs_b[None, :] < BMax) & (offs_d[:, None] < D)
 
         inds_ptrs = Inds + offs_b * stride_ib + idx
         inds_mask = offs_b < BMax
@@ -194,8 +192,7 @@ def _cce_lse_sampled_forward_kernel(
         e = tl.load(e_ptrs, mask=e_mask, other=0.0)
         c = tl.load(c_ptrs, mask=c_mask, other=0.0)
 
-        # dot_sum = tl.sum(e.to(tl.float32) * c.to(tl.float32), axis=1)
-        dot_sum = tl.dot(e.to(tl.float32), c.to(tl.float32)[:, None])
+        dot_sum = tl.sum(e.to(tl.float32) * c.to(tl.float32), axis=1)
 
         if idx > 0:
             dot_sum += tl.log(V - 1.0)
