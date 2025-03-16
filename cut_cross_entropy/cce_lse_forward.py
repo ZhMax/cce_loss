@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from cut_cross_entropy.tl_autotune import cce_forward_autotune
+from cut_cross_entropy.tl_autotune import cce_forward_autotune, cce_sampled_forward_autotune
 from cut_cross_entropy.tl_utils import b_bin_fn, tl_logaddexp, tl_softcapping
 
 
@@ -134,6 +134,100 @@ _cce_lse_forward_kernel = triton.heuristics(  # type: ignore
 _cce_lse_forward_kernel = cce_forward_autotune()(_cce_lse_forward_kernel)  # type: ignore
 
 
+def _cce_lse_sampled_forward_kernel(
+    E,
+    C,
+    Inds,
+    Bias,
+    LSE,
+    LA,
+    Locks,
+    Valids,
+    softcap,
+    B,
+    V,
+    D,
+    SAMPLE_NUMS,
+    BMax,
+    stride_eb,
+    stride_ed,
+    stride_cv,
+    stride_cd,
+    stride_ib,
+    stride_is,
+    stride_biasv,
+    stride_lse_b,
+    stride_vb,
+    num_locks,
+    # Meta-parameters
+    B_BIN,
+    HAS_BIAS: tl.constexpr,
+    HAS_VALIDS: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_D: tl.constexpr,  #
+    GROUP_B: tl.constexpr,  #
+    EVEN_D: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
+    HAS_LA: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    m = tl.full((BLOCK_B, ), float("-inf"), dtype=tl.float32)
+    d = tl.zeros((BLOCK_B, ), dtype=tl.float32)
+
+    offs_b = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    for idx in range(0, SAMPLE_NUMS):       
+        e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
+        e_mask = (offs_b[:, None] < BMax) & (offs_d[None, :] < D)
+        # e_ptrs = E + (offs_b[None, :] * stride_eb + offs_d[:, None] * stride_ed)
+        # e_mask = (offs_b[None, :] < BMax) & (offs_d[:, None] < D)
+
+        inds_ptrs = Inds + offs_b * stride_ib + idx
+        inds_mask = offs_b < BMax
+        inds = tl.load(inds_ptrs, mask=inds_mask, other=V)
+        c_ptrs = C + (inds[:, None] * stride_cv + offs_d[None, :] * stride_cd)
+        c_mask = (inds[:, None] < V) & (offs_d[None, :] < D)
+
+        e = tl.load(e_ptrs, mask=e_mask, other=0.0)
+        c = tl.load(c_ptrs, mask=c_mask, other=0.0)
+
+        # dot_sum = tl.sum(e.to(tl.float32) * c.to(tl.float32), axis=1)
+        dot_sum = tl.dot(e.to(tl.float32), c.to(tl.float32)[:, None])
+
+        if idx > 0:
+            dot_sum += tl.log(V - 1.0)
+            dot_sum -= tl.log(1.0 * SAMPLE_NUMS)
+
+        block_max = dot_sum
+        m_new = tl.maximum(m, block_max)
+        d = d * tl.exp(m - m_new) + tl.exp(dot_sum - m_new)
+        m = m_new
+
+    lse = m + tl.log(d)
+    lse_ptrs = LSE + offs_b
+    out_mask = (offs_b < BMax)
+    tl.store(lse_ptrs, lse, mask = out_mask)
+
+_cce_lse_sampled_forward_kernel = triton.jit(_cce_lse_sampled_forward_kernel)
+_cce_lse_sampled_forward_kernel = triton.heuristics(  # type: ignore
+    {
+        "EVEN_D": lambda args: args["D"] % args["BLOCK_D"] == 0,
+        "HAS_BIAS": lambda args: args["Bias"] is not None,
+        "HAS_VALIDS": lambda args: args["Valids"] is not None,
+        "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
+        "HAS_LA": lambda args: args["LA"] is not None,
+        "GROUP_B": lambda args: 8,
+        "DOT_PRECISION": lambda args: "tf32"
+        if torch.get_float32_matmul_precision() == "high"
+        else "ieee",
+    }
+)(_cce_lse_sampled_forward_kernel)
+_cce_lse_sampled_forward_kernel = cce_sampled_forward_autotune()(_cce_lse_sampled_forward_kernel)  # type: ignore
+
+
 @overload
 def cce_lse_forward_kernel(
     e: torch.Tensor,
@@ -174,6 +268,7 @@ def cce_lse_forward_kernel(
     valids: torch.Tensor | None = None,
     softcap: float | None = None,
     return_logit_avg: bool = False,
+    item_inds: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
     # Check constraints.
     assert e.shape[1] == c.shape[1], "Incompatible dimensions"
@@ -191,44 +286,85 @@ def cce_lse_forward_kernel(
     V, D = c.shape
     # Allocates output.
     lse = e.new_full((B,), -float("inf"), dtype=torch.float32)
-    locks = e.new_full(
-        (triton.cdiv(B, 128),),
-        0,
-        dtype=torch.uint32,
-    )
 
-    if return_logit_avg:
-        logit_avg = e.new_full((V,), 0.0, dtype=torch.float32)
+
+    if item_inds is None:
+        locks = e.new_full(
+            (triton.cdiv(B, 128),),
+            0,
+            dtype=torch.uint32,
+        )
+
+        if return_logit_avg:
+            logit_avg = e.new_full((V,), 0.0, dtype=torch.float32)
+        else:
+            logit_avg = None
+
+        # 1D launch kernel where each block gets its own program.
+        def grid(META) -> tuple[int]:
+            return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(V, META["BLOCK_V"]),)
+
+        _cce_lse_forward_kernel[grid](
+            e,
+            c,
+            bias,
+            lse,  #
+            logit_avg,
+            locks,
+            valids,
+            softcap,
+            B,
+            V,
+            D,  #
+            e.size(0),
+            e.stride(0),
+            e.stride(1),  #
+            c.stride(0),
+            c.stride(1),  #
+            1 if bias is None else bias.stride(0),
+            lse.stride(0),
+            1 if valids is None else valids.stride(0),
+            num_locks=locks.size(0),
+            B_BIN=b_bin_fn(B),
+        )
     else:
-        logit_avg = None
-
-    # 1D launch kernel where each block gets its own program.
-    def grid(META) -> tuple[int]:
-        return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(V, META["BLOCK_V"]),)
-
-    _cce_lse_forward_kernel[grid](
-        e,
-        c,
-        bias,
-        lse,  #
-        logit_avg,
-        locks,
-        valids,
-        softcap,
-        B,
-        V,
-        D,  #
-        e.size(0),
-        e.stride(0),
-        e.stride(1),  #
-        c.stride(0),
-        c.stride(1),  #
-        1 if bias is None else bias.stride(0),
-        lse.stride(0),
-        1 if valids is None else valids.stride(0),
-        num_locks=locks.size(0),
-        B_BIN=b_bin_fn(B),
-    )
+        SAMPLE_NUMS = item_inds.size(1)
+        if return_logit_avg:
+            logit_avg = e.new_full((SAMPLE_NUMS,), 0.0, dtype=torch.float32)
+        else:
+            logit_avg = None
+        # 1D launch kernel where each block gets its own program.
+        def grid(META) -> tuple[int]:
+            return (triton.cdiv(B, META['BLOCK_B']), )
+        BLOCK_D = int(2**torch.ceil(torch.log2(torch.tensor(D))))
+        _cce_lse_sampled_forward_kernel[grid](
+            e,
+            c,
+            item_inds,
+            bias,
+            lse,  #
+            logit_avg,
+            None, #locks
+            valids,
+            softcap,
+            B,
+            V,
+            D,  #
+            SAMPLE_NUMS,
+            e.size(0),
+            e.stride(0),
+            e.stride(1),  #
+            c.stride(0),
+            c.stride(1),  #
+            item_inds.stride(0),
+            item_inds.stride(1),
+            1 if bias is None else bias.stride(0),
+            lse.stride(0),
+            1 if valids is None else valids.stride(0),
+            num_locks=None, # num_locks=locks.size(0),
+            B_BIN=b_bin_fn(B),
+            BLOCK_D=BLOCK_D
+        )
 
     if return_logit_avg:
         assert logit_avg is not None

@@ -433,6 +433,13 @@ def _cce_forward_best_config() -> Config:
     return Config(dict(BLOCK_B=256, BLOCK_V=128, BLOCK_D=32), num_warps=8, num_stages=3)
 
 
+def _cce_sampled_forward_best_config() -> Config:
+    # return Config(dict(BLOCK_B=32, BLOCK_V=128), num_warps=2, num_stages=3)
+    # return Config(dict(BLOCK_B=128, BLOCK_V=128), num_warps=16, num_stages=4)
+    return Config(dict(BLOCK_B=32, BLOCK_V=128), num_warps=16, num_stages=4)
+
+
+
 def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
     if _AUTOTUNE:
         return _cce_autotune(
@@ -450,6 +457,23 @@ def cce_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heur
         return _heuristics_from_config(_cce_forward_best_config())
 
 
+def cce_sampled_forward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
+    if _AUTOTUNE:
+        return _cce_autotune(
+            configs=get_autotune_config(),
+            key=["V", "D", "B_BIN"],
+            prune_configs_by={
+                "early_config_prune": early_config_prune,
+                "perf_model": estimate_matmul_time,
+                "top_k": 10,
+            },
+            restore_value=["LSE"],
+            reset_to_zero=["LA"],
+        )
+    else:
+        return _heuristics_from_config(_cce_sampled_forward_best_config())
+
+
 def _bw_total_ops_fn(B, V, D) -> float:
     return 2 * B * V * D + 6 * B * V + 0.2 * (2 * B * V * D + 2 * B * V * D)
 
@@ -461,6 +485,11 @@ def _bw_total_store_fn(B, V, D, dtsize, num_cta_b, num_cta_v):
 def _cce_backward_best_config() -> Config:
     return Config(dict(BLOCK_B=128, BLOCK_V=128, BLOCK_D=32), num_warps=4, num_stages=4)
 
+
+def _cce_sampled_backward_best_config() -> Config:
+    # return Config(dict(BLOCK_B=32, BLOCK_V=128), num_warps=2, num_stages=5)
+    # return Config(dict(BLOCK_B=128, BLOCK_V=128), num_warps=16, num_stages=4)
+    return Config(dict(BLOCK_B=32, BLOCK_V=128), num_warps=16, num_stages=4)
 
 def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
     if _AUTOTUNE:
@@ -482,6 +511,28 @@ def cce_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heu
         )
     else:
         return _heuristics_from_config(_cce_backward_best_config())
+
+
+def cce_sampled_backward_autotune() -> Callable[..., autotuner.Autotuner | autotuner.Heuristics]:
+    if _AUTOTUNE:
+        return _cce_autotune(
+            configs=get_autotune_config(),
+            key=["V", "D", "B_BIN"],
+            prune_configs_by={
+                "early_config_prune": functools.partial(
+                    early_config_prune, shared_memory_factor=2.0
+                ),
+                "perf_model": functools.partial(
+                    estimate_matmul_time,
+                    total_ops_fn=_bw_total_ops_fn,
+                    total_store_fn=_bw_total_store_fn,
+                ),
+                "top_k": 5,
+            },
+            reset_to_zero=["dE", "dC", "dEC", "dCC", "dBias"],
+        )
+    else:
+        return _heuristics_from_config(_cce_sampled_backward_best_config())
 
 
 def _indexed_dot_best_config() -> Config:

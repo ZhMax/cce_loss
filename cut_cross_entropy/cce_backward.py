@@ -3,7 +3,7 @@ import torch
 import triton
 import triton.language as tl
 
-from cut_cross_entropy.tl_autotune import cce_backward_autotune
+from cut_cross_entropy.tl_autotune import cce_backward_autotune, cce_sampled_backward_autotune
 from cut_cross_entropy.tl_utils import (
     b_bin_fn,
     tl_and_reduce_fn,
@@ -294,6 +294,177 @@ _cce_backward_kernel = triton.heuristics(  # type: ignore
 _cce_backward_kernel = cce_backward_autotune()(_cce_backward_kernel)  # type: ignore
 
 
+def _cce_sampled_backward_kernel(
+    E,
+    C,
+    Inds,
+    Bias,
+    LSE,
+    dOut,
+    grad_scale,
+    Valids,
+    VocabOrdering,
+    softcap,
+    Targets,
+    dE,
+    dEC,
+    dELocks,
+    dC,
+    dCC,
+    dCLocks,
+    dBias,
+    B,
+    D,
+    V,
+    SAMPLE_NUMS,
+    BMax,
+    n_de_locks_0,
+    n_de_locks_1,
+    n_dc_locks_0,
+    n_dc_locks_1,
+    stride_eb,
+    stride_ed,
+    stride_cv,
+    stride_cd,
+    stride_ib,
+    stride_is,
+    stride_biasv,
+    stride_vb,
+    filter_eps,
+    shift,
+    B_BIN,
+    BLOCK_B: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    MM_BACK_BLOCK_D: tl.constexpr,
+    GROUP_B: tl.constexpr,
+    EVEN_D: tl.constexpr,
+    MM_BACK_EVEN_D: tl.constexpr,
+    ITEM_DO: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_VALIDS: tl.constexpr,
+    HAS_VOCAB_ORDERING: tl.constexpr,
+    FILTER_GRAD: tl.constexpr,
+    HAS_TARGETS: tl.constexpr,
+    HAS_SOFTCAP: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
+    USE_KAHAN: tl.constexpr,
+    COMPUTE_DC: tl.constexpr,
+    COMPUTE_DE: tl.constexpr,
+    COMPUTE_DBIAS: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    idx = tl.program_id(axis=1)
+    offs_b = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # de_accum = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float16)
+    # dc_accum = tl.zeros((BLOCK_B, BLOCK_D), dtype=tl.float16)
+    # inds_accum = tl.zeros((BLOCK_B, ), dtype=tl.int32)
+    # for idx in range(0, SAMPLE_NUMS):       
+    e_ptrs = E + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
+    e_mask = (offs_b[:, None] < BMax) & (offs_d[None, :] < D)
+
+    inds_ptrs = Inds + offs_b * stride_ib + idx
+    inds_mask = offs_b < BMax
+    inds = tl.load(inds_ptrs, mask=inds_mask, other=V)        
+    c_ptrs = C + (inds[:, None] * stride_cv + offs_d[None, :] * stride_cd)
+    c_mask = (inds[:, None] < V) & (offs_d[None, :] < D)
+
+    e = tl.load(e_ptrs, mask=e_mask, other=0.0)
+    c = tl.load(c_ptrs, mask=c_mask, other=0.0)
+
+    dot_sum = tl.sum(e.to(tl.float32) * c.to(tl.float32), axis=1)
+
+    if idx > 0:
+        dot_sum += tl.log(V - 1.0)
+        dot_sum -= tl.log(1.0 * SAMPLE_NUMS)
+
+    lse = tl.load(LSE + offs_b, mask=offs_b < B, other=float("inf"))
+
+    d_accum = tl.exp(dot_sum - lse)
+    d_accum = tl.where(inds < V, d_accum, 0.0)
+
+    if HAS_TARGETS:
+        if HAS_SHIFT:
+            target_offs_b = offs_b + shift
+        else:
+            target_offs_b = offs_b
+
+        targets = tl.load(Targets + target_offs_b, mask=target_offs_b < BMax, other=V + 1)
+        is_target = targets == idx
+        d_accum += tl.where(is_target, -1.0, 0.0)
+    else:
+        is_target = None      
+
+
+    if ITEM_DO:
+        d_out = tl.load(dOut)
+    else:
+        if HAS_SHIFT:
+            d_out_offs_b = offs_b + shift
+        else:
+            d_out_offs_b = offs_b
+
+        d_out = tl.load(dOut + d_out_offs_b, mask=d_out_offs_b < BMax, other=0.0)
+
+    d_out = grad_scale * d_out
+    d_accum = d_accum * d_out
+    d_accum = d_accum.to(e_ptrs.dtype.element_ty)
+
+    if COMPUTE_DE:
+        de_ptrs = dE + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
+        de_mask = (offs_b[:, None] < BMax) & (offs_d[None, :] < D)
+        de_out = d_accum[:, None] * c
+        tl.atomic_add(de_ptrs, de_out, mask=de_mask)
+
+    if COMPUTE_DC:
+        dc_ptrs = dC + (inds[:, None] * stride_cv + offs_d[None, :] * stride_cd)
+        dc_mask = (inds[:, None] < V) & (offs_d[None, :] < D)
+        dc_out = d_accum[:, None] * e
+        tl.atomic_add(dc_ptrs, dc_out, mask=dc_mask)
+
+    #     if COMPUTE_DE:
+    #         de_accum += d_accum[:, None] * c
+        
+    #     if COMPUTE_DC:
+    #         dc_accum += d_accum[:, None] * e
+    
+
+    # if COMPUTE_DE:
+    #     de_ptrs = dE + (offs_b[:, None] * stride_eb + offs_d[None, :] * stride_ed)
+    #     de_mask = (offs_b[:, None] < BMax) & (offs_d[None, :] < D)
+    #     tl.store(de_ptrs, de_accum, mask=de_mask)    
+
+    # if COMPUTE_DC:
+    #     dc_ptrs = dC + (inds[:, None] * stride_cv + offs_d[None, :] * stride_cd)
+    #     dc_mask = (inds[:, None] < V) & (offs_d[None, :] < D)
+    #     tl.store(dc_ptrs, dc_accum, mask=dc_mask)
+
+
+
+_cce_sampled_backward_kernel = triton.jit(_cce_sampled_backward_kernel)
+_cce_sampled_backward_kernel = triton.heuristics(  # type: ignore
+    {
+        "EVEN_D": lambda args: (args["D"] % args["BLOCK_D"]) == 0,
+        "MM_BACK_BLOCK_D": lambda args: _cce_back_block_d(args),
+        "MM_BACK_EVEN_D": lambda args: (args["D"] % _cce_back_block_d(args)) == 0,
+        "HAS_VALIDS": lambda args: args["Valids"] is not None,
+        "HAS_BIAS": lambda args: args["Bias"] is not None,
+        "HAS_VOCAB_ORDERING": lambda args: args["VocabOrdering"] is not None,
+        "FILTER_GRAD": lambda args: args["filter_eps"] is not None,
+        "HAS_TARGETS": lambda args: args["Targets"] is not None,
+        "HAS_SOFTCAP": lambda args: args["softcap"] is not None,
+        "HAS_SHIFT": lambda args: args["shift"] != 0,
+        "ITEM_DO": lambda args: args["dOut"].numel() == 1,
+        "GROUP_B": lambda args: 8,
+        "COMPUTE_DC": lambda args: args["dC"] is not None,
+        "COMPUTE_DE": lambda args: args["dE"] is not None,
+        "COMPUTE_DBIAS": lambda args: args["dBias"] is not None,
+    }
+)(_cce_sampled_backward_kernel)
+_cce_sampled_backward_kernel = cce_sampled_backward_autotune()(_cce_sampled_backward_kernel)  # type: ignore
+
 def cce_backward_kernel(
     do: torch.Tensor,
     e: torch.Tensor,
@@ -308,6 +479,7 @@ def cce_backward_kernel(
     vocab_ordering: torch.Tensor | None = None,
     grad_scale: float = 1.0,
     use_kahan: bool = False,
+    item_inds: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
     assert do.numel() in (e.size(0), 1)
     assert c.size(1) == e.size(1)
@@ -365,65 +537,130 @@ def cce_backward_kernel(
         do = do.contiguous()
         lse = lse.contiguous()
         assert do.stride(0) == lse.stride(0), f"{do.stride()=}, {lse.stride()=}"
+    
+    if item_inds is None:
+        def grid(META):
+            return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(c.size(0), META["BLOCK_V"]),)
 
-    def grid(META):
-        return (triton.cdiv(B, META["BLOCK_B"]) * triton.cdiv(c.size(0), META["BLOCK_V"]),)
+        if vocab_ordering is not None:
+            assert vocab_ordering.ndim == 1
+            assert vocab_ordering.numel() == c.size(0)
+            assert vocab_ordering.stride(0) == 1
 
-    if vocab_ordering is not None:
-        assert vocab_ordering.ndim == 1
-        assert vocab_ordering.numel() == c.size(0)
-        assert vocab_ordering.stride(0) == 1
+        nd_locks = triton.cdiv(c.size(1), 64)
+        if de is not None:
+            de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
+            de_lock_sizes = de_locks.size()
+        else:
+            de_locks = None
+            de_lock_sizes = (None, None)
 
-    nd_locks = triton.cdiv(c.size(1), 64)
-    if de is not None:
-        de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
-        de_lock_sizes = de_locks.size()
+        if dc is not None:
+            dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
+            dc_lock_sizes = dc_locks.size()
+        else:
+            dc_locks = None
+            dc_lock_sizes = (None, None)
+
+        _cce_backward_kernel[grid](
+            e,
+            c,
+            bias,
+            lse,
+            do,
+            grad_scale,
+            valids,
+            vocab_ordering,
+            softcap,
+            targets,
+            de,
+            dec,
+            de_locks,
+            dc,
+            dcc,
+            dc_locks,
+            dbias,
+            B,
+            e.size(1),
+            c.size(0),
+            e.size(0),
+            *de_lock_sizes,
+            *dc_lock_sizes,
+            e.stride(0),
+            e.stride(1),
+            c.stride(0),
+            c.stride(1),
+            1 if bias is None else bias.stride(0),
+            1 if valids is None else valids.stride(0),
+            filter_eps,
+            shift=shift,
+            B_BIN=b_bin_fn(B),
+            USE_KAHAN=use_kahan,
+        )
     else:
-        de_locks = None
-        de_lock_sizes = (None, None)
+        SAMPLE_NUMS = item_inds.size(1)
+        def grid(META):
+            return (triton.cdiv(B, META["BLOCK_B"]), SAMPLE_NUMS)
+        D = e.size(1)
+        BLOCK_D = int(2**torch.ceil(torch.log2(torch.tensor(D))))
 
-    if dc is not None:
-        dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
-        dc_lock_sizes = dc_locks.size()
-    else:
-        dc_locks = None
-        dc_lock_sizes = (None, None)
+        # nd_locks = triton.cdiv(c.size(1), 64)
+        # if de is not None:
+        #     de_locks = e.new_zeros((triton.cdiv(B, 128), nd_locks), dtype=torch.int32)
+        #     de_lock_sizes = de_locks.size()
+        # else:
+        #     de_locks = None
+        #     de_lock_sizes = (None, None)
 
-    _cce_backward_kernel[grid](
-        e,
-        c,
-        bias,
-        lse,
-        do,
-        grad_scale,
-        valids,
-        vocab_ordering,
-        softcap,
-        targets,
-        de,
-        dec,
-        de_locks,
-        dc,
-        dcc,
-        dc_locks,
-        dbias,
-        B,
-        e.size(1),
-        c.size(0),
-        e.size(0),
-        *de_lock_sizes,
-        *dc_lock_sizes,
-        e.stride(0),
-        e.stride(1),
-        c.stride(0),
-        c.stride(1),
-        1 if bias is None else bias.stride(0),
-        1 if valids is None else valids.stride(0),
-        filter_eps,
-        shift=shift,
-        B_BIN=b_bin_fn(B),
-        USE_KAHAN=use_kahan,
-    )
+        # if dc is not None:
+        #     dc_locks = c.new_zeros((triton.cdiv(c.size(0), 128), nd_locks), dtype=torch.int32)
+        #     dc_lock_sizes = dc_locks.size()
+        # else:
+        #     dc_locks = None
+        #     dc_lock_sizes = (None, None)
+
+        targets_cce_sampled_loss = torch.zeros_like(lse)
+
+        _cce_sampled_backward_kernel[grid](
+            e,
+            c,
+            item_inds,
+            bias,
+            lse,
+            do,
+            grad_scale,
+            valids,
+            vocab_ordering,
+            softcap,
+            targets_cce_sampled_loss,
+            de,
+            None, #dec,
+            None,#de_locks,
+            dc,
+            None, #dcc,
+            None, #dc_locks,
+            dbias,
+            B,
+            D,
+            c.size(0),
+            SAMPLE_NUMS,
+            e.size(0),
+            *(None, None), #*de_lock_sizes,
+            *(None, None), #*dc_lock_sizes,
+            e.stride(0),
+            e.stride(1),
+            c.stride(0),
+            c.stride(1),
+            item_inds.stride(0),
+            item_inds.stride(1),
+            1 if bias is None else bias.stride(0),
+            1 if valids is None else valids.stride(0),
+            filter_eps,
+            shift=shift,
+            B_BIN=b_bin_fn(B),
+            USE_KAHAN=use_kahan,
+            BLOCK_D=BLOCK_D
+        )        
 
     if dbias is not None:
         assert bias is not None

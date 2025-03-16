@@ -26,6 +26,7 @@ class CCEParams:
     shift: int
     batch_shape: torch.Size
     use_kahan: bool
+    item_inds: torch.Tensor | None
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -42,7 +43,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         bias: torch.Tensor | None,
         params: CCEParams,
     ) -> torch.Tensor:
-        needs_grad = e.requires_grad or c.requires_grad
+        needs_grad = e.requires_grad or c.requires_grad        
         return_logit_avg = needs_grad and params.filter_eps is not None
 
         ret = cce_lse_forward_kernel(
@@ -52,6 +53,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             valids=params.valids,
             softcap=params.softcap,
             return_logit_avg=return_logit_avg,
+            item_inds=params.item_inds
         )
         if return_logit_avg:
             assert isinstance(ret, tuple)
@@ -126,6 +128,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             vocab_ordering=vocab_ordering,
             grad_scale=grad_scale,
             use_kahan=params.use_kahan,
+            item_inds=params.item_inds
         )
 
         return de, dc, dbias, None
